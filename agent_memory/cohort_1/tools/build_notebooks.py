@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import nbformat
+from notebook_setup import add_dependency_setup
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +53,7 @@ def attach_diagrams(cells, data_dir):
 def build_main():
     cells = read_lesson(ROOT / "tools/travel_lesson.txt")
     attach_diagrams(cells, ROOT / "data")
+    cells = add_dependency_setup(cells)
     notebook = nbformat.v4.new_notebook(cells=cells)
     notebook.metadata.kernelspec = {"display_name": "Python 3", "language": "python", "name": "python3"}
     notebook.metadata.language_info = {"name": "python", "version": "3.12"}

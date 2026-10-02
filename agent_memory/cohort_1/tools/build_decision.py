@@ -6,6 +6,7 @@ import black
 import nbformat
 from build_notebooks import ROOT
 from cell_explanations import ensure_explanations
+from notebook_setup import SETUP_TAG, add_dependency_setup
 
 text = (ROOT / 'tools/decision_components.py').read_text()
 functions = {n.name: ast.get_source_segment(text, n) for n in ast.parse(text).body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -19,6 +20,8 @@ def add(source, explanation, tag='runtime'):
 
 
 for original in base.cells:
+    if SETUP_TAG in original.metadata.get('tags', []):
+        continue
     cell = copy.deepcopy(original)
     if cell.cell_type == 'markdown':
         if '### Reference architecture' in cell.source:
@@ -84,6 +87,7 @@ display(pd.DataFrame(reader_results))''', 'Compare the same real candidate pool 
 
 cells.insert(1, nbformat.v4.new_markdown_cell('### Closed and open decision models\n\nThis separate edition preserves Parts 0–12 and adds explicit typed decision hooks at their point of use. Jev runs as a hosted closed model. Cloudflare CLEF supplies open weights with the same question interface. Raw Anthropic remains mandatory for generation and entity extraction; no generation-off path is introduced. Live travel evidence still comes from Tavily and HNSW retrieval from Oracle.'))
 cells = ensure_explanations(cells)
+cells = add_dependency_setup(cells)
 nb = nbformat.v4.new_notebook(cells=cells, metadata=copy.deepcopy(base.metadata))
 for index, cell in enumerate(cells):
     cell.id = hashlib.sha256(f'decisions:{index}:{cell.source}'.encode()).hexdigest()[:12]

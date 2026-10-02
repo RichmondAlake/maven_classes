@@ -7,6 +7,7 @@ import black
 import nbformat
 from build_notebooks import ROOT
 from cell_explanations import ensure_explanations
+from notebook_setup import SETUP_TAG, add_dependency_setup
 
 SOURCE = ROOT / 'tools/memorizz_components.py'
 text = SOURCE.read_text().replace('return DIM\n', 'return DIMENSIONS\n').replace('"dimensions": DIM,', '"dimensions": DIMENSIONS,')
@@ -22,6 +23,8 @@ def add_code(source, explanation, tag='runtime'):
 
 
 for original in base.cells:
+    if SETUP_TAG in original.metadata.get('tags', []):
+        continue
     cell = copy.deepcopy(original)
     if cell.cell_type == 'markdown':
         cell.source = cell.source.replace('Implementing Memory Aware Agents\n', 'Implementing Memory Aware Agents · Memorizz edition\n', 1)
@@ -125,6 +128,7 @@ entity_memory = EntityMemory(provider)''', 'Create **OracleProvider(config)** wi
 
 cells.insert(1, nbformat.v4.new_markdown_cell('### What changes in this edition?\n\nThe educational Parts and live travel use case are preserved. Memorizz supplies KnowledgeBase ingestion, MemoryManager retrieval, ConversationMemoryUnit, EntityMemory, Workflow and atomic summary/source links. OracleSemanticCache remains the requested langchain_oracledb abstraction around raw Anthropic. Versioned host state and compressed archives stay explicit so their context-engineering behavior is visible. Install `requirements-memorizz.txt`, which uses the published Memorizz 0.13.0 package. This notebook retains the manual loop so every context and memory step is visible. The appbook Tokenomics comparison also runs native MemAgent as a separate implementation.'))
 cells = ensure_explanations(cells)
+cells = add_dependency_setup(cells, 'requirements-memorizz.txt')
 nb = nbformat.v4.new_notebook(cells=cells, metadata=copy.deepcopy(base.metadata))
 nb.metadata.memorizz_package = 'memorizz==0.13.0'
 for index, cell in enumerate(cells):

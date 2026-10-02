@@ -18,6 +18,8 @@ The [appbook](appbook/README.md) runs at http://localhost:8031 and provides live
 
 Use Python 3.11 or 3.12 and a dedicated Oracle AI Database schema with VECTOR support, table quota, and a configured HNSW vector-memory pool. Do not use an administrative schema. This validation uses Oracle 26ai.
 
+Open Jupyter from the `cohort_1` folder. Each notebook starts with a `%pip install` cell that installs the requirements into its active kernel, including `sentence-transformers`. Run that cell once, restart the kernel after installation, then run the lesson cells in order. The Memorizz notebook installs `requirements-memorizz.txt`, which includes the base requirements and the published Memorizz package.
+
 ```bash
 python -m pip install -r requirements.txt
 # For the Memorizz edition:

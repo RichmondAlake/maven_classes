@@ -13,7 +13,9 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -145,7 +147,17 @@ try:
         print(f"Running cell {index}: {cell.source.splitlines()[0][:85]}", flush=True)
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                exec(compile(cell.source, f"{source.name}:cell-{index}", "exec"), namespace)
+                if "dependency-install" in cell.metadata.get("tags", []):
+                    # Match %pip: install with this runner's Python interpreter.
+                    command = next(line for line in cell.source.splitlines() if line.startswith("%pip "))
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", *shlex.split(command[5:])],
+                        capture_output=True, text=True,
+                    )
+                    print(result.stdout + result.stderr)
+                    result.check_returncode()
+                else:
+                    exec(compile(cell.source, f"{source.name}:cell-{index}", "exec"), namespace)
                 namespace["display"] = capture_display
 
             cell.outputs = [nbformat.v4.new_output("stream", name="stdout", text=scrub(output.getvalue()))]
