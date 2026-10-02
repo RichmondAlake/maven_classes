@@ -1,0 +1,18 @@
+flowchart TD
+    request[Traveler supplies trip and preferences] --> memory[Load session, current entities and bounded conversation]
+    workflow[Load recent decisions, tool calls and outcomes] --> memory
+    memory --> context[Stable cached instructions + changing memory suffix]
+    context --> budget{Token threshold reached?}
+    budget -- Yes --> compact[LLM summary + exact source archive]
+    compact --> pointer[Memory ID and description]
+    pointer --> loop[Raw Anthropic agent loop]
+    budget -- No --> loop
+    loop --> retrieval[Oracle HNSW retrieval → reranker]
+    loop --> live[Tavily live flight, hotel and transport research]
+    live --> offload[Compressed full response + bounded preview]
+    offload --> workflow
+    retrieval --> workflow
+    loop --> unpack[Just-in-time unpack by memory ID]
+    unpack --> archive[(Oracle scoped archive + checksum)]
+    archive --> workflow
+    loop --> summary[Grounded research shortlist and supplier links]

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Wayfinder / Agent Memory Appbook</title>
+  <meta name="description" content="Build a memory-aware travel assistant, one working component at a time.">
+  <link rel="icon" href="data:,"><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/refarch.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#assistant"><span class="brand-mark">W↗</span><span><strong>WAYFINDER</strong><small>Agent memory appbook</small></span></a>
+      <div class="nav-label">YOUR WORKSPACE</div>
+      <a class="nav home-nav" href="#assistant"><span class="nav-number">↗</span><span>Travel assistant</span><i class="live-dot"></i></a>
+      <div class="nav-label">EXPLORE MEMORY IN ACTION</div>
+      <nav id="chapters" aria-label="Workshop chapters"></nav>
+      <div class="sidebar-foot"><span class="eyebrow">MAVEN CLASSES · COHORT 01</span><p>Live interactions. Observable memory.<br>Measure every technique.</p></div>
+    </aside>
+    <div class="main">
+      <header class="topbar"><button id="menu" class="icon-button menu" aria-label="Toggle chapters">☰</button><span class="breadcrumb">IMPLEMENTING MEMORY AWARE AGENTS</span><div class="topbar-status"><span id="db-status" class="pill">Oracle · warming</span><span id="model-status" class="pill">Checking model</span><button id="theme" class="icon-button" aria-label="Switch color theme">◐</button></div></header>
+      <main id="stage" class="stage" tabindex="-1"><p>Loading your appbook…</p></main>
+    </div>
+  </div>
+  <section class="explorer" aria-label="Oracle data explorer">
+    <button class="explorer-handle" id="explorer-toggle" aria-expanded="false" aria-controls="explorer-body"><span><b class="db-glyph">DB</b><strong>Oracle AI Database</strong><small>Live memory explorer · read only</small></span><span id="table-count">Durable memory tables</span><span class="chevron">⌃</span></button>
+    <div id="explorer-body" hidden><aside id="table-list"></aside><div class="table-view"><div id="table-head">Choose a memory table.</div><div id="table-grid"></div></div><pre id="row-inspector">Select a row to inspect its full contents.</pre></div>
+  </section>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/refarch.js"></script><script src="/experiment_config.js"></script><script src="/architecture.js"></script><script src="/visuals.js"></script><script src="/lab_interfaces.js"></script><script src="/tokenomics_view.js"></script><script src="/app.js"></script>
+</body>
+</html>

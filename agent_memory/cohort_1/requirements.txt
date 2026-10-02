@@ -1,0 +1,15 @@
+jupyterlab>=4.4,<5
+nbformat>=5.10,<6
+nbclient>=0.10,<1
+nbconvert>=7.16,<8
+oracledb>=3.0,<27
+sentence-transformers==5.1.2
+transformers>=4.57,<5
+numpy>=1.26,<3
+pandas>=2.2,<4
+anthropic>=0.116,<2
+tavily-python>=0.8.4,<1
+langchain-oracledb==1.5.0
+python-dotenv>=1.0,<2
+requests>=2.32,<3
+black>=25,<27
