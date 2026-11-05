@@ -1,0 +1,1054 @@
+# %% [markdown]
+# Implementing Memory Aware Agents · Memorizz edition
+## Build a personal travel assistant with Oracle AI Database
+
+**Maven · Agent Memory · Cohort 2**
+
+The same travel assistant as the from-scratch notebook, built with the
+published **Memorizz** package. Memorizz supplies the agent loop (**MemAgent**)
+and every memory type, and stores each one in its own Oracle table:
+knowledge, conversation, entities, workflows, summaries, tools, tool results
+and the semantic cache. Claude runs through Memorizz's **Anthropic** provider
+and Tavily through its **TavilyProvider**.
+
+The from-scratch notebook shows how each memory works by writing it by hand.
+This notebook shows how to get the same behaviour from a framework, and where
+the application still has to write code itself.
+
+Search results are evidence with a source URL, not confirmed fares or
+reservations. This lesson ends with a grounded shortlist and supplier links.
+
+# %% [markdown]
+### The Parts we will assemble
+
+| Part | Component | Memorizz piece |
+|---|---|---|
+| 0 | Setup | OracleProvider, Anthropic provider, TavilyProvider |
+| 1 | Embedding model | A local encoder behind Memorizz's embedding interface |
+| 2 | Retrieval pipeline | KnowledgeBase ingestion and HNSW search in Oracle |
+| 3 | Reranker | A hosted Hugging Face cross-encoder over KnowledgeBase candidates |
+| 4 | RAG | KnowledgeBase passages answered by the Anthropic provider |
+| 5 | Agentic RAG | MemAgent choosing between web search and the knowledge base |
+| 6 | Session memory | The current trip kept in EntityMemory |
+| 7 | Semantic cache | SemanticCache |
+| 8 | Conversational memory | MemAgent conversation history and entity fact capture |
+| 9 | Toolbox memory | Toolbox plus MemAgent's semantic tool routing |
+| 10 | Workflow memory | Workflow records written by MemAgent |
+| 11 | Compaction & compression | Tool-result offloading, tool logs and summaries |
+| 12 | Integrated assistant | One MemAgent with every memory type |
+
+### Reference architecture
+
+![Memorizz travel assistant architecture](attachment:travel_architecture_memorizz.png)
+
+The appbook's [interactive architecture](http://localhost:8031/#architecture)
+includes a native **MemAgent** lane and compares it with the custom loop and an
+append-only agent.
+
+**Memory** is information retained for future selection. **Context** is the
+information chosen for one call. MemAgent selects context from memory on every
+turn; this notebook makes those selections visible.
+
+# %% [markdown]
+# Part 0 · Set up the classroom environment
+
+Run the install cell above once, restart the kernel, then run these cells in
+order. You need an Oracle AI Database schema with vector support, an Anthropic key,
+a Tavily key and a Hugging Face access token.
+
+# %% runtime
+import json
+import os
+import time
+import hashlib
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from getpass import getpass
+from importlib.metadata import version
+
+import numpy as np
+import oracledb
+import pandas as pd
+
+from IPython.display import display
+
+import memorizz
+from memorizz import MemAgent
+from memorizz.embeddings import BaseEmbeddingProvider
+from memorizz.enums.memory_type import MemoryType
+from memorizz.internet_access.providers.tavily import TavilyProvider
+from memorizz.llms.anthropic import Anthropic
+from memorizz.long_term.procedural.toolbox import Toolbox
+from memorizz.long_term.semantic.entity_memory import EntityMemory
+from memorizz.long_term.semantic.knowledge_base import KnowledgeBase
+from memorizz.memory_provider.oracle import OracleConfig, OracleProvider
+from memorizz.short_term_memory.semantic_cache import SemanticCache, SemanticCacheConfig
+from memorizz.tooling import ContextPolicy, ToolResultPolicy
+
+MEMORIZZ_VERSION = version("memorizz")
+print("Memorizz", MEMORIZZ_VERSION)
+
+# %% [markdown]
+### Part 0.1 · Private keys and readable records
+
+**request_secret(name)** asks for a hidden value with getpass. The validation
+runner sets NOTEBOOK_USE_ENV_KEYS=1 to read keys from its environment instead.
+**pretty(value)** prints readable JSON. **digest(value)** turns a value into a
+stable ID; it is not encryption.
+
+# %% runtime
+def request_secret(name):
+    if os.getenv("NOTEBOOK_USE_ENV_KEYS") == "1":
+        value = os.environ.get(name, "").strip()
+    else:
+        value = getpass(f"Enter {name}: ").strip()
+
+    if not value:
+        raise ValueError(f"{name} is required.")
+
+    return value
+
+
+def pretty(value):
+    return json.dumps(value, indent=2, ensure_ascii=False, default=str)
+
+
+def digest(value):
+    encoded = json.dumps(value, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+# %% [markdown]
+### Part 0.2 · Trusted traveler scope
+
+**Scope** carries application-owned tenant, user and thread identifiers.
+Memorizz calls the traveler's memory bucket **memory_id**, the person
+**user_id** and the conversation **thread_id**. The host sets them on every
+call; the model never chooses them.
+
+# %% runtime
+@dataclass(frozen=True)
+class Scope:
+    tenant_id: str
+    user_id: str
+    thread_id: str
+
+    @property
+    def owner(self):
+        return digest([self.tenant_id, self.user_id])
+
+
+SCOPE = Scope(
+    tenant_id=os.getenv("TRAVEL_TENANT", "cohort-2"),
+    user_id=os.getenv("TRAVEL_USER", "local-traveler"),
+    thread_id=os.getenv("TRAVEL_THREAD", "travel-planning"),
+)
+
+# %% [markdown]
+### Part 0.3 · Oracle credentials
+
+Use a dedicated learner schema, never SYS or SYSTEM. Memorizz opens its own
+connection pool in Part 1. The plain connection below is only for looking at
+the tables Memorizz creates.
+
+# %% runtime
+DB_USER = os.getenv("ORACLE_USER") or input("Oracle schema user: ").strip()
+DB_DSN = os.getenv("ORACLE_DSN") or input("Oracle DSN: ").strip()
+DB_PASSWORD = os.getenv("ORACLE_PASSWORD") or getpass("Oracle password: ")
+
+if DB_USER.lower() in {"sys", "system"}:
+    raise ValueError("Use a dedicated learner schema.")
+
+conn = oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
+
+
+def rows(sql, binds=None):
+    with conn.cursor() as cursor:
+        cursor.execute(sql, binds or {})
+        names = [column[0].lower() for column in cursor.description]
+        return [dict(zip(names, record)) for record in cursor.fetchall()]
+
+# %% [markdown]
+### Part 0.4 · Claude and Tavily through Memorizz
+
+**Anthropic** is Memorizz's Claude provider. Prompt caching is on by default.
+MemAgent uses it for every decision, and **generate_text(prompt, instructions)**
+handles the few direct calls in this notebook. **TavilyProvider** is
+Memorizz's web-search provider.
+
+**generate(prompt, instructions, purpose)** wraps generate_text and records
+each call's time and token usage in **CALLS**, so later Parts can count model
+calls.
+
+# %% runtime
+LLM_MODEL_ID = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
+
+llm = Anthropic(
+    api_key=request_secret("ANTHROPIC_API_KEY"),
+    model=LLM_MODEL_ID,
+    effort="low",
+    max_tokens=4096,
+)
+search = TavilyProvider(api_key=request_secret("TAVILY_API_KEY"))
+CALLS = []
+
+
+def generate(prompt, instructions="Answer the request accurately.", purpose="generation"):
+    started = time.perf_counter()
+    text = llm.generate_text(prompt, instructions=instructions)
+    CALLS.append({"purpose": purpose, "seconds": time.perf_counter() - started, **(llm.get_last_usage() or {})})
+    return text
+
+# %% [markdown]
+**generate_json(prompt, instructions, purpose)** asks for one JSON object and
+allows one correction when the reply is not valid JSON.
+
+# %% runtime
+def generate_json(prompt, instructions="Return one JSON object.", purpose="structured generation"):
+    for attempt in range(2):
+        text = generate(prompt, instructions, purpose).strip()
+
+        if text.startswith("```"):
+            text = "\n".join(text.splitlines()[1:-1])
+
+        try:
+            value = json.loads(text)
+            if isinstance(value, dict):
+                return value
+            raise ValueError("Expected a JSON object.")
+        except ValueError:
+            if attempt == 1:
+                raise
+            prompt += "\nReturn only a valid JSON object, without commentary."
+
+# %% [markdown]
+### Experiment · a model call does not remember the previous call
+
+Each call sends only its own prompt. The second call below cannot see the
+first one. Memory is what the application stores and sends back.
+
+# %% example
+generate("My favourite seat is the aisle. Reply with OK.", purpose="stateless demo")
+print(generate("Which seat do I prefer? If you cannot know, say so.", purpose="stateless demo"))
+
+# %% [markdown]
+### Collect the real trip
+
+**parse_trip(request)** extracts the trip you describe into a record:
+origin, destination, dates, budget, currency and constraints. Missing details
+stay empty; nothing is invented.
+
+# %% runtime
+def parse_trip(request):
+    return generate_json(
+        pretty({"traveler_request": request}),
+        instructions=(
+            "Extract a travel record from traveler_request. Return one JSON object with keys "
+            "origin, destination, departure_date, return_date, budget, currency and constraints. "
+            "Dates are ISO dates if fully specified, otherwise null. Constraints is a list. "
+            "Unknown values are null. Do not answer the request or invent preferences."
+        ),
+        purpose="trip extraction",
+    )
+
+# %% [markdown]
+Describe your own trip when the cell asks. An unattended run reads it from the
+**TRAVEL_REQUEST** environment variable instead.
+
+# %% example
+TRAVEL_REQUEST = os.getenv("TRAVEL_REQUEST") or input("Describe the trip you want to research: ").strip()
+TRIP = parse_trip(TRAVEL_REQUEST)
+print(pretty(TRIP))
+
+# %% [markdown]
+# Part 1 · Embedding Model: make meaning searchable
+
+An embedding turns text into a vector, so a question can find a stored passage
+even when the wording differs. This notebook uses the same local MiniLM encoder
+as the from-scratch edition.
+
+Memorizz accepts any encoder that implements its **BaseEmbeddingProvider**
+interface: the vector for a text, its size, the model name and a short
+description. Oracle stores the vectors; no embedding service is needed.
+
+# %% runtime
+from sentence_transformers import SentenceTransformer
+
+EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+encoder = SentenceTransformer(EMBEDDING_MODEL_ID)
+DIMENSIONS = encoder.get_sentence_embedding_dimension()
+
+
+class LocalEmbeddings(BaseEmbeddingProvider):
+    def get_embedding(self, text, **kwargs):
+        return encoder.encode([text], normalize_embeddings=True)[0].tolist()
+
+    def get_dimensions(self):
+        return DIMENSIONS
+
+    def get_default_model(self):
+        return EMBEDDING_MODEL_ID
+
+    def get_provider_info(self):
+        return {"provider": "local", "model": EMBEDDING_MODEL_ID, "dimensions": DIMENSIONS}
+
+
+embeddings = LocalEmbeddings()
+
+# %% [markdown]
+### Experiment · compare meanings
+
+Because the vectors have unit length, their dot product is the cosine
+similarity: higher means closer in meaning. The two flight sentences should
+score higher with each other than with the hotel sentence.
+
+# %% example
+examples = [
+    "I want a nonstop flight.",
+    "I prefer a direct flight.",
+    "The hotel has a quiet refundable room.",
+]
+vectors = np.array([embeddings.get_embedding(text) for text in examples])
+
+display(pd.DataFrame([
+    {"first": examples[i], "second": examples[j], "cosine similarity": round(float(vectors[i] @ vectors[j]), 3)}
+    for i, j in [(0, 1), (0, 2), (1, 2)]
+]))
+
+# %% [markdown]
+### Part 1.1 · Create the Oracle provider
+
+**OracleProvider** is Memorizz's Oracle store. It creates one table per memory
+type and an HNSW vector index on each, the first time that memory is searched.
+**in_database_embedding=False** uses the local encoder above, and
+**vector_search_mode="approximate"** makes searches use the HNSW indexes.
+
+# %% runtime
+provider = OracleProvider(OracleConfig(
+    user=DB_USER,
+    password=DB_PASSWORD,
+    dsn=DB_DSN,
+    in_database_embedding=False,
+    embedding_provider=embeddings,
+    index_policy="lazy",
+    vector_search_mode="approximate",
+    pool_min=1,
+    pool_max=3,
+))
+
+assert provider.preflight()["ok"], "Check the schema's privileges and vector memory."
+print("Connected to Oracle as", DB_USER)
+
+# %% [markdown]
+# Part 2 · Retrieval Pipeline: turn live sources into durable evidence
+
+The write path searches the web, stores each result as knowledge with its URL,
+and embeds it. The read path finds the passages closest to a question.
+
+**KnowledgeBase** is Memorizz's knowledge store. **ingest_knowledge** chunks a
+text, embeds each chunk and stores it under a **namespace**, here *policy*.
+**ingest_results(results, namespace, scope)** stores each Tavily result with its
+title, URL and retrieval time.
+
+# %% runtime
+knowledge = KnowledgeBase(provider)
+
+
+def ingest_results(results, namespace="policy", scope=SCOPE):
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    ids = []
+
+    for result in results:
+        if not result.snippet.strip():
+            continue
+
+        ids.append(knowledge.ingest_knowledge(
+            result.snippet,
+            namespace=namespace,
+            chunk_size=800,
+            chunk_overlap=80,
+            user_id=scope.owner,
+            metadata={"url": result.url, "title": result.title, "retrieved_at": retrieved_at},
+        ))
+
+    return ids
+
+# %% [markdown]
+**POLICY_QUERY** is a question about a travel rule that affects your trip, such as
+an airline's checked-baggage allowance or a hotel's cancellation policy, for
+example *TAP Air Portugal economy checked baggage allowance*. You type it when the
+cell asks; an unattended run reads it from the **TRAVEL_POLICY_QUERY** environment
+variable instead. The cell searches the live web and stores the results as
+**policy** knowledge. Parts 2, 3 and 4 reuse the same question.
+
+# %% example
+POLICY_QUERY = os.getenv("TRAVEL_POLICY_QUERY") or input("Policy query for your trip: ").strip()
+policy_results = search.search(POLICY_QUERY, max_results=5)
+knowledge_ids = ingest_results(policy_results)
+
+display(pd.DataFrame([{"title": r.title, "url": r.url, "score": r.score} for r in policy_results]))
+print("Stored", len(knowledge_ids), "results as policy knowledge")
+
+# %% [markdown]
+### Part 2.1 · Search the knowledge base
+
+**retrieve(question, namespace, k, scope)** calls
+**retrieve_knowledge_by_query**. Memorizz embeds the question and runs an
+approximate HNSW search in Oracle, limited to this traveler's knowledge.
+Each result keeps its text, URL and similarity score.
+
+# %% runtime
+def retrieve(question, namespace="policy", k=6, scope=SCOPE):
+    return knowledge.retrieve_knowledge_by_query(question, namespace=namespace, limit=k, user_id=scope.owner)
+
+# %% [markdown]
+The table shows the closest passages, and the second query lists the vector
+indexes Memorizz created in your schema.
+
+# %% example
+candidates = retrieve(POLICY_QUERY)
+
+display(pd.DataFrame([
+    {"rank": rank, "title": (item.get("title") or "")[:50], "score": round(float(item["score"]), 3), "url": item.get("url")}
+    for rank, item in enumerate(candidates, start=1)
+]).set_index("rank"))
+
+display(pd.DataFrame(rows("""
+    SELECT table_name, index_name, status
+    FROM user_indexes
+    WHERE index_type = 'VECTOR'
+    ORDER BY table_name
+""")))
+
+# %% [markdown]
+# Part 3 · Reranker: reorder retrieved passages by relevance
+
+The embedding model scores the question and each passage separately. A
+cross-encoder reads them together and estimates how relevant the passage is,
+then reorders the candidates so the most relevant come first.
+
+This edition uses a **hosted** reranker: the same cross-encoder,
+[cross-encoder/ms-marco-MiniLM-L6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2),
+that the from-scratch notebook runs locally and that Oracle can load as an
+in-database ONNX model, served by Hugging Face Inference Providers. It needs a
+free Hugging Face access token, **HF_TOKEN**.
+
+Memorizz can attach a hosted reranker to MemAgent, but its built-in options are
+Voyage, Cohere and OpenAI, not Hugging Face. So **rerank(question, candidates,
+keep)** calls the endpoint directly: it sends the question and the candidate
+texts, and receives a relevance score for each.
+
+# %% runtime
+import requests
+
+RERANKER_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANK_URL = f"https://router.huggingface.co/hf-inference/models/{RERANKER_MODEL_ID}"
+HF_TOKEN = request_secret("HF_TOKEN")
+
+
+def rerank(question, candidates, keep=3):
+    response = requests.post(
+        RERANK_URL,
+        headers={"Authorization": f"Bearer {HF_TOKEN}"},
+        json={"inputs": {"query": question, "texts": [item["content"] for item in candidates]}},
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    scores = {row["index"]: float(row["score"]) for row in response.json()}
+    order = sorted(scores, key=scores.get, reverse=True)
+    return [{**candidates[index], "rerank_score": scores[index]} for index in order[:keep]]
+
+# %% [markdown]
+Compare the vector order with the reranked order for the same candidates.
+
+# %% example
+reranked = rerank(POLICY_QUERY, candidates, keep=len(candidates))
+
+display(pd.DataFrame([
+    {"reranked position": position, "title": (item.get("title") or "")[:50],
+     "vector rank": next(i for i, c in enumerate(candidates, start=1) if c is item or c["_id"] == item["_id"]),
+     "rerank score": round(item["rerank_score"], 2)}
+    for position, item in enumerate(reranked, start=1)
+]).set_index("reranked position"))
+
+# %% [markdown]
+# Part 4 · RAG: answer from selected evidence
+
+**rag_answer(question, trip)** retrieves knowledge, keeps the three best
+passages after reranking and asks Claude to answer from them with the trip
+stated explicitly. The model sees only these passages and the trip, so every
+claim can be traced to a URL.
+
+# %% runtime
+def rag_answer(question, trip, scope=SCOPE):
+    passages = rerank(question, retrieve(question, scope=scope), keep=3)
+    evidence = [{"url": item.get("url"), "title": item.get("title"), "text": item["content"]} for item in passages]
+
+    answer = generate(
+        pretty({"question": question, "trip": trip, "evidence": evidence}),
+        instructions=(
+            "Answer the question using only the evidence. Cite the URL for each claim. "
+            "Say what the evidence does not cover. Do not claim to book anything."
+        ),
+        purpose="RAG answer",
+    )
+    return {"answer": answer, "sources": [item["url"] for item in evidence]}
+
+# %% [markdown]
+Ask your policy question with your trip as explicit context.
+
+# %% example
+rag_result = rag_answer(POLICY_QUERY, TRIP)
+print(rag_result["answer"])
+print(pretty(rag_result["sources"]))
+
+# %% [markdown]
+# Part 5 · Agentic RAG: choose which evidence to fetch
+
+In RAG the application decides what to retrieve. In **agentic RAG** the model
+decides: search the live web, look up stored knowledge, or answer.
+
+**MemAgent** is Memorizz's agent loop. Given an **internet_access_provider**, it
+offers Claude an **internet_search** tool; with **KNOWLEDGE_BASE** memory it
+also offers **knowledge_base_lookup**. MemAgent validates each tool call, runs
+it, stores the outcome and repeats until Claude answers or **max_steps** is
+reached. The from-scratch notebook writes this loop and its action protocol by
+hand.
+
+**make_agent(name, memory_types, instruction, ...)** builds each MemAgent in this
+notebook with the same Claude provider, Oracle store and step budget.
+**automations_enabled=False** leaves out Memorizz's timer and scheduling tools,
+which a travel assistant does not need. **ToolResultPolicy(offload_above_chars=2000)**
+keeps large search results out of the prompt; Part 11 looks at what it stores.
+
+# %% runtime
+TRAVEL_INSTRUCTION = (
+    "You are a travel research assistant. Research flights, hotels, transport and travel rules "
+    "with the available tools, and cite the URL of every source you use. Treat search results as "
+    "evidence that can change, not confirmed prices or availability. Never claim to book anything. "
+    "Use the current trip and remembered preferences. If something is unknown, say so."
+)
+
+
+def make_agent(name, memory_types, instruction=TRAVEL_INSTRUCTION, **options):
+    return MemAgent(
+        name=name,
+        model=llm,
+        memory_provider=provider,
+        memory_types=memory_types,
+        instruction=instruction,
+        max_steps=8,
+        automations_enabled=False,
+        **options,
+    )
+
+
+research_agent = make_agent(
+    "travel-research",
+    [MemoryType.CONVERSATION_MEMORY, MemoryType.KNOWLEDGE_BASE, MemoryType.WORKFLOW_MEMORY],
+    internet_access_provider=search,
+    tool_result_policy=ToolResultPolicy(offload_above_chars=2000),
+)
+
+# %% [markdown]
+**run_agent(agent, request, context, scope)** runs one turn for this traveler
+and thread. It records MemAgent's trace events, so the result lists every tool
+call with its arguments, alongside Memorizz's usage and context-window counts.
+MemAgent reports an internal error as text; run_agent raises it instead.
+
+# %% runtime
+def run_agent(agent, request, context=None, scope=SCOPE):
+    events = []
+    agent.set_stream_event_callback(events.append)
+    started = time.perf_counter()
+
+    try:
+        answer = agent.run(
+            request,
+            memory_id=scope.owner,
+            thread_id=scope.thread_id,
+            user_id=scope.owner,
+            context=context,
+        )
+    finally:
+        agent.set_stream_event_callback(None)
+
+    if answer.startswith("I apologize, but I encountered an error"):
+        raise RuntimeError(answer)
+
+    return {
+        "answer": answer,
+        "seconds": time.perf_counter() - started,
+        "tool_calls": [
+            {"tool": event["tool_name"], "arguments": event.get("content")}
+            for event in events if event.get("trace_kind") == "tool_call"
+        ],
+        "usage": agent.get_last_run_usage(),
+        "context_window": agent.get_context_window_stats(),
+    }
+
+# %% [markdown]
+Ask for live travel options. The table shows which tools Claude chose and with
+what arguments.
+
+# %% example
+research = run_agent(
+    research_agent,
+    "Find two flight options and one quiet hotel near the centre for my trip. Keep it brief and cite URLs.",
+    context={"trip": TRIP},
+)
+
+print(research["answer"])
+display(pd.DataFrame(research["tool_calls"]))
+
+# %% [markdown]
+# Part 6 · Session Memory: resume the active trip
+
+Session memory is the current working state: the trip being planned now.
+Memorizz has no separate session store, so the trip is kept as an entity in
+**EntityMemory**, one record named *current trip* with one attribute per field.
+Upserting the same name updates that record in place, so a later conversation,
+or a restarted notebook, can resume it.
+
+**save_trip** and **load_trip** are the application's session layer. The trip
+reaches the agent through **run(context=...)** on every turn.
+
+# %% runtime
+entity_memory = EntityMemory(provider)
+
+
+def save_trip(trip, scope=SCOPE):
+    attributes = [
+        {"name": key, "value": value if isinstance(value, str) else json.dumps(value)}
+        for key, value in trip.items() if value not in (None, "", [])
+    ]
+    return entity_memory.upsert_entity(
+        name="current trip", entity_type="trip", attributes=attributes,
+        memory_id=scope.owner, user_id=scope.owner,
+    )
+
+
+def load_trip(scope=SCOPE):
+    entity = entity_memory.get_entity_by_name("current trip", memory_id=scope.owner, user_id=scope.owner)
+    return {attribute["name"]: attribute["value"] for attribute in entity["attributes"]} if entity else {}
+
+# %% [markdown]
+Save the trip from Part 0, then read it back from Oracle.
+
+# %% example
+save_trip(TRIP)
+print(pretty(load_trip()))
+
+# %% [markdown]
+# Part 7 · Semantic Cache: reuse stable answers carefully
+
+A semantic cache returns a stored answer when a new question means the same
+as an earlier one, without calling the model. It suits stable explanations,
+not live travel prices.
+
+**SemanticCache** is Memorizz's cache, stored in Oracle. It embeds the question
+and returns a stored answer when the cosine similarity is at least
+**similarity_threshold**. A high threshold such as 0.975 accepts small wording
+changes and rejects different questions.
+
+**cached_explanation(question, scope)** checks the cache, otherwise asks Claude
+and stores the answer.
+
+# %% runtime
+semantic_cache = SemanticCache(
+    SemanticCacheConfig(similarity_threshold=0.975, enable_session_scoping=False, ttl_hours=1),
+    memory_provider=provider,
+    agent_id="memory-explainer",
+    memory_id=SCOPE.owner,
+)
+
+
+def cached_explanation(question, scope=SCOPE):
+    cached = semantic_cache.get(question, user_id=scope.owner)
+    if cached is not None:
+        return {"answer": cached, "cache_hit": True}
+
+    answer = generate(
+        question,
+        instructions="Explain the agent-memory concept in under 120 words. Do not research travel offers.",
+        purpose="semantic cache miss",
+    )
+    semantic_cache.set(question, answer, user_id=scope.owner)
+    return {"answer": answer, "cache_hit": False}
+
+# %% [markdown]
+### Experiment · a miss, then a hit for a similar question
+
+The first question produces an actual answer. The second asks the same thing in
+different words (*pick* instead of *choose*); it is close enough to return the
+stored answer without a model call.
+
+# %% example
+cache_question = "How does retrieval help an agent choose relevant memories?"
+similar_question = "How does retrieval help an agent pick relevant memories?"
+
+calls_before = len(CALLS)
+started = time.perf_counter()
+first = cached_explanation(cache_question)
+first_seconds = time.perf_counter() - started
+
+started = time.perf_counter()
+second = cached_explanation(similar_question)
+second_seconds = time.perf_counter() - started
+
+display(pd.DataFrame([
+    {"request": "first", "hit": first["cache_hit"], "seconds": round(first_seconds, 3)},
+    {"request": "similar wording", "hit": second["cache_hit"], "seconds": round(second_seconds, 3)},
+]))
+print("New model calls:", len(CALLS) - calls_before)
+assert second["cache_hit"] and first["answer"] == second["answer"]
+
+# %% [markdown]
+A question with the same intent but very different wording usually misses at
+this threshold. A looser threshold reuses more answers but risks returning an
+answer to a different question.
+
+# %% example
+paraphrase = cached_explanation("Why retrieve selected memories for an agent's next context?")
+print("Cache hit:", paraphrase["cache_hit"])
+print({key: value for key, value in semantic_cache.statistics().items() if key in ("hits", "misses", "writes", "size")})
+
+# %% [markdown]
+# Part 8 · Conversational Memory: events and current entities
+
+MemAgent stores every user and assistant turn as **conversation memory** and
+reloads the recent turns of the thread on the next call.
+
+**Entity memory** keeps durable facts about a person, such as seat or hotel
+preferences. **capture_entity_facts(text)** asks Claude to extract the facts
+stated in a message and stores them as attributes of the traveler's entity,
+each with its source thread. A later correction updates the attribute.
+
+# %% runtime
+chat_agent = make_agent(
+    "travel-chat",
+    [MemoryType.CONVERSATION_MEMORY, MemoryType.ENTITY_MEMORY],
+    instruction=(
+        "You are a travel assistant. Acknowledge the traveler's message in one or two sentences. "
+        "Do not call tools: the application saves preferences itself."
+    ),
+)
+
+
+def traveler_facts(scope=SCOPE):
+    return [
+        {"entity": entity["name"], "attribute": attribute["name"], "value": attribute["value"],
+         "updated_at": attribute.get("updated_at")}
+        for entity in entity_memory.list_entities(memory_id=scope.owner, user_id=scope.owner)
+        if entity.get("entity_type") != "trip"
+        for attribute in entity.get("attributes", [])
+    ]
+
+# %% [markdown]
+State a preference in your own words. The turn is stored as conversation, and
+its facts are captured as entity attributes. An unattended run reads the text
+from **TRAVEL_PREFERENCE_TEXT**.
+
+# %% example
+PREFERENCE_TEXT = os.getenv("TRAVEL_PREFERENCE_TEXT") or input("A travel preference to remember: ").strip()
+
+reply = run_agent(chat_agent, PREFERENCE_TEXT, context={"trip": load_trip()})
+chat_agent.capture_entity_facts(PREFERENCE_TEXT, user_id=SCOPE.owner, memory_id=SCOPE.owner, thread_id=SCOPE.thread_id)
+
+print(reply["answer"])
+display(pd.DataFrame(traveler_facts()))
+
+# %% [markdown]
+Correct a preference. The seat attribute is replaced rather than duplicated, and
+the conversation keeps both messages. Entity capture stores lasting facts; a
+message such as *for this trip only* may be treated as temporary and not stored.
+
+# %% example
+correction = "Actually, I prefer a window seat, not an aisle seat."
+run_agent(chat_agent, correction, context={"trip": load_trip()})
+chat_agent.capture_entity_facts(correction, user_id=SCOPE.owner, memory_id=SCOPE.owner, thread_id=SCOPE.thread_id)
+
+display(pd.DataFrame(traveler_facts()))
+history = chat_agent.load_conversation_history(memory_id=SCOPE.owner, thread_id=SCOPE.thread_id, user_id=SCOPE.owner)
+display(pd.DataFrame([
+    {"role": turn["role"], "content": turn["content"][:90]}
+    for turn in history if turn["role"] in ("user", "assistant")
+]))
+
+# %% [markdown]
+# Part 9 · Toolbox Memory: retrieve the tools a request needs
+
+**Toolbox memory** stores what the agent can do. Each entry is a tool
+definition: a name, a description and its parameters, embedded and stored in
+Oracle. Instead of placing every tool in every prompt, the agent is offered
+only the few that fit the request.
+
+The Python functions stay in the application. A stored definition describes a
+tool but cannot add one: only functions registered in this process can run.
+
+The five tools below call real public services that need no API key:
+[Open-Meteo](https://open-meteo.com/) for weather and daylight,
+[Frankfurter](https://frankfurter.dev/) for European Central Bank exchange
+rates and [Nager.Date](https://date.nager.at/) for public holidays.
+
+# %% include travel-tools
+
+# %% [markdown]
+### Part 9.2 · Store the tools and let MemAgent route them
+
+**Toolbox.from_functions** stores each function's name, docstring and
+signature in Oracle and embeds them. Passed to MemAgent, the toolbox drives
+**semantic tool routing**: on each turn MemAgent offers the tools whose
+descriptions best match the request.
+
+**ContextPolicy** controls that routing. **tool_top_k=2** offers at most two
+tools. **stable_tool_list_tokens=0** turns off the shortcut that sends every
+tool when the whole list is small, so routing is visible even with five tools.
+
+# %% runtime
+toolbox = Toolbox.from_functions(TRAVEL_TOOLS, memory_provider=provider)
+TOOL_POLICY = ContextPolicy(stable_tool_list_tokens=0, tool_top_k=2, sticky_tool_limit=0)
+
+tool_agent = make_agent(
+    "travel-tools",
+    [MemoryType.CONVERSATION_MEMORY, MemoryType.WORKFLOW_MEMORY],
+    toolbox=toolbox,
+    context_policy=TOOL_POLICY,
+)
+
+# %% [markdown]
+**preview(question)** asks MemAgent's router which stored tools it would offer,
+without calling Claude. The router has no relevance cut-off: it always offers
+the tool_top_k closest tools, so even the flight question is offered one. Claude
+then decides whether to call it. The from-scratch notebook adds a distance limit
+so that an unrelated request is offered no tools.
+
+# %% example
+tool_questions = [
+    f"Will it rain in {place} during my trip?",
+    f"How much is my budget in the local currency of {place}?",
+    f"Is anything closed for public holidays while I am in {place}?",
+    f"What time does it get dark in {place}?",
+    f"Find me a direct flight to {place}.",
+]
+
+display(pd.DataFrame([
+    {"question": question, "tools offered": tool_agent.semantic_tool_router.preview(question, user_id=SCOPE.owner)}
+    for question in tool_questions
+]))
+
+# %% [markdown]
+# Part 10 · Workflow Memory: retain decisions and tool outcomes
+
+Every MemAgent turn that calls tools is stored as a **workflow**: the request,
+each tool call with its arguments and result, whether each call succeeded, and
+the overall outcome. A later turn can look up what was already tried instead of
+repeating it.
+
+Memorizz stores workflows automatically but does not put them back into the
+prompt by itself. **workflow_memory(query, scope)** retrieves the most relevant
+ones for the application to inspect or pass on.
+
+# %% runtime
+def workflow_memory(query, limit=5, scope=SCOPE):
+    return research_agent.memory_manager.retrieve_relevant_memories(
+        query, MemoryType.WORKFLOW_MEMORY, scope.owner, limit=limit, user_id=scope.owner,
+    )
+
+# %% [markdown]
+Look up the workflow stored by the research turn in Part 5.
+
+# %% example
+display(pd.DataFrame([
+    {
+        "request": workflow["user_query"][:70],
+        "outcome": workflow["outcome"],
+        "tool calls": [step.split(": ", 1)[-1] for step in workflow["steps"]],
+        "all succeeded": all((step.get("tool_outcome") or {}).get("ok", step.get("error") is None) for step in workflow["steps"].values()),
+    }
+    for workflow in workflow_memory("flight and hotel research")
+]))
+
+# %% [markdown]
+# Part 11 · Compaction & Compression: retain evidence, bound context
+
+Context grows with every search result and every turn. Memorizz bounds it in
+three ways.
+
+**Tool-result offloading.** With **ToolResultPolicy**, a tool result longer
+than offload_above_chars is stored in Oracle's tool log; the prompt receives a
+short digest and a pointer. If Claude needs the full text, it calls
+**retrieve_tool_log_entry**: a just-in-time read.
+
+**Summaries.** **generate_summaries** condenses a thread's turns into a stored
+summary that later turns can recall, with links to the source messages.
+
+**Automatic compaction.** **ContextPolicy(compact_at, keep_recent_messages)**
+summarizes older messages when a request reaches compact_at percent of the
+context window, keeping the newest messages word for word.
+
+The tool log below shows what the research turn offloaded. Each row is a full
+search result kept in Oracle. Compare it with the Part 5 tool calls: each
+**retrieve_tool_log_entry** call is Claude asking for a full result back.
+Offloading saves tokens only when the digest is enough.
+
+# %% example
+tool_logs = research_agent.memory_manager.list_tool_logs(SCOPE.owner, 10, SCOPE.owner, SCOPE.thread_id)
+
+display(pd.DataFrame([
+    {"tool": log["tool_name"], "arguments": str(log.get("arguments"))[:70], "stored characters": len(str(log.get("result", "")))}
+    for log in tool_logs
+]))
+print("Tools called in Part 5:", [call["tool"] for call in research["tool_calls"]])
+
+# %% [markdown]
+Summarize the thread so far. **keep_recent=2** leaves the two newest messages
+out of the summary, as compaction would keep them in the prompt.
+
+# %% example
+chat_agent.generate_summaries(memory_id=SCOPE.owner, user_id=SCOPE.owner, thread_id=SCOPE.thread_id, keep_recent=2)
+summaries = chat_agent.memory_manager.load_summaries_for_thread(
+    SCOPE.owner, agent_id=chat_agent.agent_id, limit=1, user_id=SCOPE.owner, thread_id=SCOPE.thread_id,
+)
+
+for summary in summaries:
+    print("Summarizes", summary["memory_units_count"], "messages")
+    print(summary["content"][:900])
+
+# %% [markdown]
+# Part 12 · Put it together: the memory-aware travel assistant
+
+One MemAgent now combines everything:
+
+1. **Claude** through Memorizz's Anthropic provider, with prompt caching;
+2. **conversation, workflow, summary, entity and knowledge** memory in Oracle;
+3. **TavilyProvider** for live search and the **toolbox** with semantic routing;
+4. **ToolResultPolicy** offloading and **ContextPolicy** routing and compaction;
+5. the **current trip** from Part 6, passed as context on every turn.
+
+MemAgent recalls conversation, entity facts and knowledge into each prompt on
+its own. The application supplies the trip and the scope.
+
+# %% runtime
+travel_agent = make_agent(
+    "travel-assistant",
+    [
+        MemoryType.CONVERSATION_MEMORY,
+        MemoryType.WORKFLOW_MEMORY,
+        MemoryType.SUMMARIES,
+        MemoryType.ENTITY_MEMORY,
+        MemoryType.KNOWLEDGE_BASE,
+    ],
+    internet_access_provider=search,
+    toolbox=toolbox,
+    context_policy=ContextPolicy(stable_tool_list_tokens=0, tool_top_k=2, sticky_tool_limit=0, compact_at=80, keep_recent_messages=6),
+    tool_result_policy=ToolResultPolicy(offload_above_chars=2000),
+)
+
+
+def agent_turn(request, scope=SCOPE):
+    return run_agent(travel_agent, request, context={"trip": load_trip(scope)}, scope=scope)
+
+# %% [markdown]
+### Run the integrated assistant
+
+This turn makes live searches and Claude decisions. Read the sources and the
+tool calls. The assistant researches; it does not book.
+
+# %% example
+agent_result = agent_turn(TRAVEL_REQUEST)
+
+print(agent_result["answer"])
+display(pd.DataFrame(agent_result["tool_calls"]))
+
+# %% [markdown]
+Memorizz reports the turn's usage. **cached_tokens** is the prompt prefix Claude
+read from its prompt cache instead of processing again; **cost_usd** is
+Memorizz's estimate for the turn. The context-window figures show how full the
+last prompt was.
+
+# %% example
+usage = agent_result["usage"]
+window = agent_result["context_window"] or {}
+display(pd.DataFrame([{
+    "model calls": usage["calls"],
+    "input tokens": usage["input_tokens"],
+    "cached tokens": usage["cached_tokens"],
+    "output tokens": usage["output_tokens"],
+    "estimated USD": round(usage["cost_usd"], 4),
+    "last prompt tokens": window.get("prompt_tokens"),
+    "window used %": round(window.get("percentage_used") or 0, 1),
+}]))
+
+# %% [markdown]
+### Ask a follow-up that needs toolbox memory
+
+The follow-up runs in the same thread, so the conversation, trip and
+preferences carry over. Routing offers the weather and holiday tools; the table
+shows which ones Claude called.
+
+# %% example
+follow_up = agent_turn(f"Will the weather or any public holidays affect my plans in {place}?")
+
+print(follow_up["answer"])
+display(pd.DataFrame(follow_up["tool_calls"]))
+
+# %% [markdown]
+### Inspect the memory in Oracle
+
+Every memory type is a table in your schema. The counts below are the rows in
+each table after the lesson. The toolbox table holds the five travel tools and
+the definitions of Memorizz's built-in tools, such as web search, that the
+notebook's agents registered.
+
+# %% example
+memory_tables = {
+    "knowledge": "KNOWLEDGE_BASE",
+    "conversation": "CONVERSATION_MEMORY",
+    "entities": "ENTITY_MEMORY",
+    "workflows": "WORKFLOW_MEMORY",
+    "summaries": "SUMMARIES",
+    "tool log": "TOOL_LOG",
+    "toolbox": "TOOLBOX",
+    "semantic cache": "SEMANTIC_CACHE",
+}
+existing = {row["table_name"] for row in rows("SELECT table_name FROM user_tables")}
+
+display(pd.DataFrame([
+    {"memory": label, "table": table, "rows": rows(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]}
+    for label, table in memory_tables.items() if table in existing
+]))
+
+# %% [markdown]
+### Trace the full memory lifecycle
+
+| Memory | Memorizz component | Formed by | Selected for context |
+|---|---|---|---|
+| Knowledge | KnowledgeBase | ingest_knowledge from Tavily results | HNSW search, then reranking (Parts 2–4) or knowledge_base_lookup |
+| Session | EntityMemory *current trip* | save_trip | Passed as run(context=...) |
+| Semantic cache | SemanticCache | set after a miss | Similarity at or above the threshold |
+| Conversation | MemAgent conversation memory | Every turn | Recent turns of the thread |
+| Entities | EntityMemory | capture_entity_facts | Recalled each turn |
+| Toolbox | Toolbox | from_functions | Semantic tool routing, top k |
+| Workflow | MemAgent workflow memory | Every turn that calls tools | Retrieved by the application |
+| Tool results | Tool log | Offloading above a size limit | Digest in the prompt; full text on request |
+| Summaries | Summaries | generate_summaries or automatic compaction | Recalled with the thread |
+
+# %% [markdown]
+# References and next reading
+
+- [Memorizz on PyPI](https://pypi.org/project/memorizz/) and [source](https://github.com/RichmondAlake/memorizz)
+- [Oracle AI Vector Search](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/)
+- [Oracle HNSW syntax and parameters](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/hierarchical-navigable-small-world-index-syntax-and-parameters.html)
+- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search)
+- [From-scratch edition of this lesson](implementing_memory_aware_agents.ipynb)
+
+# %% [markdown]
+Close the provider and the inspection connection. The memory stays in Oracle.
+
+# %% example
+provider.close()
+conn.close()
+print("Closed; durable memory remains in Oracle.")

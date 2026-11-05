@@ -1,0 +1,18 @@
+flowchart TD
+    s1["1. Traveler request<br/>User supplies trip details and explicit preferences"]
+    s2["2. Load current memory<br/>Session · entity profile · conversation · workflow outcomes · retrieved tools"]
+    s3["3. Construct the context<br/>Stable cached prefix → changing memory suffix"]
+    s4["4. Count tokens and compact<br/>Host threshold + agent-requested compaction"]
+    s5["5. Model chooses an action<br/>Raw Anthropic · cache read/write usage is visible"]
+    s6["6. Retrieve, search or call a tool<br/>Oracle HNSW → reranker · Tavily live web search · toolbox tools"]
+    s7["7. Offload and record<br/>Full tool payload → compressed Oracle object · success/failure event"]
+    s8["8. Read details just in time<br/>ID + description → unpack summary or original result"]
+    s9["9. Grounded research shortlist<br/>Actual source links · no invented fares or reservations"]
+    s1 --> s2
+    s2 --> s3
+    s3 --> s4
+    s4 --> s5
+    s5 --> s6
+    s6 --> s7
+    s7 --> s8
+    s8 --> s9

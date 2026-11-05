@@ -1,0 +1,27 @@
+# Local credentials and environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Python, notebook and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Generated validation artifacts; main notebooks retain their real outputs
+*.executed.ipynb
+*.log
+/*validation*.json
+/appbook/*validation*.json
+/appbook/*.png
+
+# Private local connections, saved users' experiments and runtime state
+/appbook/data/
+/data/oracle*.json
