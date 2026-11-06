@@ -1020,7 +1020,7 @@ semantic_cache = OracleSemanticCache(
     create_index_if_missing=True,
     index_name="AM_CACHE_HNSW_V2",
     index_params={"idx_type": "HNSW", "accuracy": 95},
-    score_threshold=0.025,
+    score_threshold=0.3,
 )
 
 # %% [markdown]
@@ -1108,15 +1108,38 @@ assert second["cache_hit"]
 assert first["answer"] == second["answer"]
 
 # %% [markdown]
-A question with the same intent but very different wording usually misses at this
-conservative threshold. That is the trade-off: a looser threshold reuses more
-answers but risks returning an answer to a different question.
-The standalone caching course later measures independent mechanisms and the
-combined stack with actual timing and provider cost estimates.
+**score_threshold=0.3** is the largest cosine distance the cache accepts as a
+hit. That is loose enough to reuse an answer for a question with the same intent
+in very different wording. It is also loose enough to reuse it for a *different*
+question about memory. The next cell asks one of each. Both sit about 0.25 from
+the stored question with all-MiniLM-L6-v2, inside the limit.
 
 # %% example
-paraphrase = cached_explanation("Why retrieve selected memories for an agent's next context?")
-print(pretty(paraphrase))
+checks = {
+    "same intent, different wording": "Why retrieve selected memories for an agent's next context?",
+    "different question": "How does an agent forget outdated memories?",
+}
+
+outcomes = []
+for label, question in checks.items():
+    reply = cached_explanation(question)
+    outcomes.append({
+        "question": label,
+        "hit": reply["cache_hit"],
+        "reused first answer": reply["answer"] == first["answer"],
+    })
+
+display(pd.DataFrame(outcomes))
+
+# %% [markdown]
+Wherever **hit** is True, that question received the stored retrieval answer
+without a model call. That is correct for the paraphrase. For the question about
+forgetting, it is the wrong answer. Distance alone cannot separate the two, which
+is the trade-off: a looser threshold reuses more answers but risks answering a
+different question. This is why the cache identity also carries negation and
+numbers, and why live travel requests bypass the cache entirely.
+The standalone caching course later measures independent mechanisms and the
+combined stack with actual timing and provider cost estimates.
 
 # %% [markdown]
 # Part 7 · Conversational Memory: events and current entities

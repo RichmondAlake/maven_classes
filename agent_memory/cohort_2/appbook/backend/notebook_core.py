@@ -493,7 +493,7 @@ semantic_cache = OracleSemanticCache(
     create_index_if_missing=True,
     index_name="AM_CACHE_HNSW_V2",
     index_params={"idx_type": "HNSW", "accuracy": 95},
-    score_threshold=0.025,
+    score_threshold=0.3,
 )
 
 def cache_namespace(question, scope=SCOPE):

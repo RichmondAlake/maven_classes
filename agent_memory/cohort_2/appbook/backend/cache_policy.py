@@ -1,10 +1,11 @@
 """Appbook semantic cache policy: paraphrase reuse without crossing opposite intents.
 
-The notebooks keep their conservative 0.025 cosine-distance threshold, which in
-practice only matches near-identical wording. The appbook promises paraphrase
-reuse, so it widens the threshold here and, like the notebook's negation and
-number guard, places contrasting terms in the cache identity. Measured with
-all-MiniLM-L6-v2: paraphrases sit at 0.01–0.10, while short-term/long-term and
+The from-scratch notebook uses a loose 0.3 cosine-distance threshold so it can show
+both paraphrase reuse and a wrong hit for a different question. The appbook answers
+whatever the learner types, so it replaces the runtime modules' threshold with a
+tighter one here and, like the notebook's negation and number guard, places
+contrasting terms in the cache identity. Measured with all-MiniLM-L6-v2: close
+paraphrases sit at 0.01–0.10, while short-term/long-term and
 advantages/disadvantages questions sit at 0.04–0.06, so distance alone cannot
 separate them. 0.08 keeps most paraphrases and misses the rest, which is safe.
 The generated *_core.py modules are left untouched.
