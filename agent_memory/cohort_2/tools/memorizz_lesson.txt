@@ -649,15 +649,15 @@ not live travel prices.
 
 **SemanticCache** is Memorizz's cache, stored in Oracle. It embeds the question
 and returns a stored answer when the cosine similarity is at least
-**similarity_threshold**. A high threshold such as 0.975 accepts small wording
-changes and rejects different questions.
+**similarity_threshold**. Similarity is 1 minus the cosine distance, so
+**similarity_threshold=0.7** accepts any stored question within a distance of 0.3.
 
 **cached_explanation(question, scope)** checks the cache, otherwise asks Claude
 and stores the answer.
 
 # %% runtime
 semantic_cache = SemanticCache(
-    SemanticCacheConfig(similarity_threshold=0.975, enable_session_scoping=False, ttl_hours=1),
+    SemanticCacheConfig(similarity_threshold=0.7, enable_session_scoping=False, ttl_hours=1),
     memory_provider=provider,
     agent_id="memory-explainer",
     memory_id=SCOPE.owner,
@@ -705,14 +705,36 @@ print("New model calls:", len(CALLS) - calls_before)
 assert second["cache_hit"] and first["answer"] == second["answer"]
 
 # %% [markdown]
-A question with the same intent but very different wording usually misses at
-this threshold. A looser threshold reuses more answers but risks returning an
-answer to a different question.
+At 0.7 the cache also reuses the answer for a question with the same intent in
+very different wording. It does the same for a *different* question about memory.
+The next cell asks one of each. With all-MiniLM-L6-v2 both have a similarity of
+about 0.75 to the stored question, above the threshold.
 
 # %% example
-paraphrase = cached_explanation("Why retrieve selected memories for an agent's next context?")
-print("Cache hit:", paraphrase["cache_hit"])
+checks = {
+    "same intent, different wording": "Why retrieve selected memories for an agent's next context?",
+    "different question": "How does an agent forget outdated memories?",
+}
+
+outcomes = []
+for label, question in checks.items():
+    reply = cached_explanation(question)
+    outcomes.append({
+        "question": label,
+        "hit": reply["cache_hit"],
+        "reused first answer": reply["answer"] == first["answer"],
+    })
+
+display(pd.DataFrame(outcomes))
 print({key: value for key, value in semantic_cache.statistics().items() if key in ("hits", "misses", "writes", "size")})
+
+# %% [markdown]
+Wherever **hit** is True, that question received the stored retrieval answer
+without a model call. That is correct for the paraphrase. For the question about
+forgetting, it is the wrong answer. Similarity alone cannot separate the two,
+which is the trade-off: a looser threshold reuses more answers but risks
+answering a different question. That is why only stable explanations use this
+cache and live travel requests bypass it.
 
 # %% [markdown]
 # Part 8 · Conversational Memory: events and current entities
